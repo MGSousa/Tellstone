@@ -155,7 +155,7 @@ func startRESPTLSServer(t *testing.T, startTLS bool, requirePass string) (string
 
 	addr := freeAddr(t)
 	store := newFakeStore()
-	srv := NewServer(addr, store, nil, log.NewNoOpLogger(), configs, requirePass, startTLS)
+	srv := NewServer(addr, store, nil, log.NewNoOpLogger(), configs, requirePass, startTLS, nil)
 	go func() { _ = srv.ListenAndServe() }()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)

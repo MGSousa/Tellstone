@@ -146,6 +146,8 @@ Every option is available as a flag and an environment variable.
 | `--tls-cert`          | `TSD_TLS_CERT`           | _(none)_         | TLS certificate path; watched for automatic rotation     |
 | `--tls-key`           | `TSD_TLS_KEY`            | _(none)_         | TLS private key path; watched for automatic rotation     |
 | `--tls-ca`            | `TSD_TLS_CA`             | _(none)_         | Client CA path for mTLS; watched for automatic rotation  |
+| `--require-pass`      | `TSD_REQUIRE_PASS`       | _(none)_         | Single password required via `AUTH`; empty disables it   |
+| `--rbac-config`       | `TSD_RBAC_CONFIG`        | _(none)_         | YAML/JSON RBAC policy file (roles, users, default role); hot-reloaded on SIGHUP |
 | `--shutdown-timeout`  | `TSD_SHUTDOWN_TIMEOUT`  | `10s`            | Max wait for graceful shutdown on SIGINT/SIGTERM         |
 
 Runtime tuning (environment only): `TSD_GC_PERCENT` (default `-1`, GC off for a zero‑GC hot
@@ -180,9 +182,68 @@ redis-cli -p 6379 SET k v EX 60   # OK (60s TTL)
 redis-cli -p 6379 DEL foo         # (integer) 1
 ```
 
-Supported commands today: **`PING`, `GET`, `SET` (with `EX`/`PX`), `DEL`, `AUTH`**, plus
-**`STARTTLS`** when `--resp-starttls` is enabled. Unknown commands return a `-ERR` reply without
-dropping the connection.
+Supported commands today: **`PING`, `GET`, `SET` (with `EX`/`PX`), `DEL`, `AUTH`, `COMMAND`,
+`ROLE` (`CREATE`/`SETUSER`/`DELUSER`/`DELETE`/`LIST`/`GETUSER`)**. Unknown commands return a
+`-ERR` reply without dropping the connection. `STARTTLS` is additionally available when
+`--resp-starttls` is enabled.
+
+#### Authentication & RBAC
+
+Start with `--require-pass` for a single shared password, or `--rbac-config` for per-user
+authentication with role-based access control (supersedes `--require-pass`):
+
+```yaml
+# policy.yaml — loaded at startup and hot-reloaded on SIGHUP.
+# Passwords are bcrypt hashes, e.g. of "adminsecret" / "alicepw"; a password
+# is required unless the user is explicitly marked nopass.
+roles:
+  - name: admin
+    rules: ["+@all", "~*"]
+  - name: readonly
+    rules: ["+get", "~*"]
+users:
+  - name: admin
+    role: admin
+    password: "$2a$10$pcaKkTfRy.KSdNUgKszYYedE7L32P9fSEG3x1phq0EbjeYkn5WpEi"
+  - name: alice
+    role: readonly
+    password: "$2a$10$sslrTYVwaIaA7O1lhokY2OgnojP5bB8YJ/o2MXaFP1v49lG8fqJYK"
+default_role: readonly    # least privilege: fallback for users without an explicit role
+```
+
+Generate a password hash with `htpasswd -nbBC 10 "" PASSWORD | tr -d ':\n'` or
+`mkpasswd -m bcrypt PASSWORD` (bcrypt, cost 10, `$2a$10$...`). Do **not** use `openssl passwd` —
+it emits SHA-512-crypt, not bcrypt. `ROLE SETUSER` accepts a raw `>password` and bcrypt-hashes it
+server-side, so runtime-created users need no tooling.
+
+```bash
+./bin/tellstone --rbac-config policy.yaml --enable-resp
+redis-cli AUTH admin adminsecret                 # +OK
+redis-cli ROLE CREATE operator +get '~users:*'   # +OK (runtime roles)
+redis-cli ROLE SETUSER bob operator '>bobpw'     # +OK
+redis-cli ROLE GETUSER bob                       # bob / operator / 1
+```
+
+Roles are user-defined; a role's `rules` are Redis-style tokens: `+cmd` / `-cmd` grant or revoke
+one command, `+@cat` / `-@cat` a whole category, and `~prefix` whitelists a key namespace (an
+empty list or `~*` allows every key). `-` rules override `+` rules. The built-in categories:
+
+| Category | Grants |
+|----------|--------|
+| `login` | AUTH, PING, COMMAND |
+| `read` | GET, INFO |
+| `write` | SET, DEL |
+| `readwrite` | read + write + login |
+| `operator` | readwrite + FLUSH |
+| `maintenance` | FLUSH, SHUTDOWN, CONFIG, DEBUG, MONITOR |
+| `admin` | AUTH, ROLE, ACL, USER, GRANT, REVOKE |
+| `all` / `none` | every registered command / nothing |
+
+A ready-to-run policy file ships with the role example at `cmd/example/role/policy.yaml`.
+
+Unauthenticated data commands return `-NOAUTH`; commands a user's role does not grant return
+`-NOPERM`. The native binary client offers the same via `client.AuthUser` and `RoleCreate` /
+`RoleSetUser` (see `cmd/example/role`).
 
 ### Native binary protocol (Go client)
 
