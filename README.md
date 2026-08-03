@@ -183,7 +183,8 @@ redis-cli -p 6379 DEL foo         # (integer) 1
 ```
 
 Supported commands today: **`PING`, `GET`, `SET` (with `EX`/`PX`), `DEL`, `AUTH`, `COMMAND`,
-`ROLE` (`CREATE`/`SETUSER`/`DELUSER`/`DELETE`/`LIST`/`GETUSER`)**. Unknown commands return a
+`ROLE` (`CREATE`/`SETUSER`/`DELUSER`/`DELETE`/`LIST`/`GETUSER`), `ACL`
+(`SETUSER`/`DELUSER`/`LIST`/`LOG`)**. Unknown commands return a
 `-ERR` reply without dropping the connection. `STARTTLS` is additionally available when
 `--resp-starttls` is enabled.
 
@@ -243,7 +244,9 @@ A ready-to-run policy file ships with the role example at `cmd/example/role/poli
 
 Unauthenticated data commands return `-NOAUTH`; commands a user's role does not grant return
 `-NOPERM`. The native binary client offers the same via `client.AuthUser` and `RoleCreate` /
-`RoleSetUser` (see `cmd/example/role`).
+`RoleSetUser` (see `cmd/example/role`). The `ACL` command family (`ACL SETUSER` / `ACL DELUSER` /
+`ACL LIST` / `ACL LOG`) manages the same policy store through a Redis-flavored alias, driven
+end-to-end in `cmd/example/acl`.
 
 ### Native binary protocol (Go client)
 

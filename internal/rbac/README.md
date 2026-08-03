@@ -99,7 +99,7 @@ func (s *Store) Store(policy *PolicyStore)
 func (s *Store) Reload(policy *PolicyStore)            // SIGHUP path, serialized vs. mutations
 func (s *Store) CreateRole(name string, rules []string) error
 func (s *Store) SetUser(username, roleName string, passHash []byte) error
-func (s *Store) DelUser(username string)
+func (s *Store) DelUser(username string) error // rejects deleting the last ACL-management user
 func (s *Store) DeleteRole(name string) error
 
 // Per-connection authorization state — pinned at handshake
@@ -134,6 +134,13 @@ func PasswordFromOpts(opts [][]byte) ([]byte, error) // ">pw" hashes, "nopass" c
 func (s *Store) IncAuthFailure(); func (s *Store) AuthFailures() uint64
 func (s *Store) IncDenied(); func (s *Store) DeniedCommands() uint64
 func (s *Store) RoleCommandCounts() map[string]uint64
+
+// ACL LOG — the auth-failure buffer behind ACL LOG (mutex-protected, lives
+// across policy hot-swaps). LogAuthFailure records an entry and bumps the
+// auth-failure counter; AuthLog returns the entries oldest-first.
+type AuthLogEntry struct { Timestamp time.Time; Username, RemoteAddr, Reason string }
+func (s *Store) LogAuthFailure(username, remoteAddr, reason string)
+func (s *Store) AuthLog() []AuthLogEntry
 ```
 
 ---
@@ -229,4 +236,4 @@ go test -bench=. -benchmem ./internal/rbac/
 * **Mutations are serialized.** `CreateRole`/`SetUser`/`DelUser`/`DeleteRole` and `Reload` all take `mu` so a `SIGHUP` reload can never land between a mutation's clone and its republish and silently discard the other operation.
 * **Hashes are secrets.** A `User`'s `PasswordHash` is never rendered by `ROLE LIST` or `ROLE GETUSER`; only role assignment and the AUTH path touch it.
 
-*This document accurately represents the authorization core of Tellstone as of 2026-08-01.*
+*This document accurately represents the authorization core of Tellstone as of 2026-08-03.*
