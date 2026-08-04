@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"io"
 	"sync"
 	"sync/atomic"
 
@@ -296,61 +297,13 @@ func (s *Server) handleDecryptedFrames(c gnet.Conn, st *connState) gnet.Action {
 			s.shards[st.shardID].AddBytesRead(uint64(totalPacketLen))
 		}
 		if s.handler != nil {
-			var (
-				respType    MessageType
-				respPayload []byte
-				skipHandler bool
-			)
-			if msg.Type == MsgAuth {
-				result := s.handleAuthMessage(c, st, msg.Value)
-				if result.dispatched {
-					offset += totalPacketLen
-					break
-				}
-				respPayload, respType = result.respPayload, result.respType
-				skipHandler = true
-			} else if !st.authenticated && msg.Type != MsgPing {
-				respPayload, respType = ResponseAuthErr, MsgAuthErr
-				skipHandler = true
-			} else if s.policy != nil && !s.opAuthorized(msg, st) {
-				s.policy.IncDenied()
-				respPayload, respType = ResponseNotAuthorized, MsgError
-				skipHandler = true
+			respType, respPayload, skipHandler, dispatched := s.gateMessage(c, st, &msg)
+			if dispatched {
+				offset += totalPacketLen
+				break
 			}
-			if !skipHandler {
-				// PING is not gated by RBAC and never counted as a role command,
-				// keeping per-role counts symmetric with the RESP data commands.
-				if s.policy != nil && st.session != nil && msg.Type != MsgPing {
-					st.session.CountCommand()
-				}
-				respPayload, respType, err = s.handler(&msg)
-			}
-			if err != nil {
-				atomic.AddUint64(&s.handlerErrors, 1)
-				if s.logger.Enabled(log.LevelWarn) {
-					s.logger.Log(log.LevelWarn, "application handler returned execution error",
-						log.String("error", err.Error()),
-					)
-				}
-				return gnet.Close
-			}
-			if respPayload != nil {
-				if err = Write(st.tlsConn, respType, respPayload); err != nil {
-					if s.logger.Enabled(log.LevelError) {
-						s.logger.Log(log.LevelError, "failed to write tls response frame",
-							log.String("error", err.Error()),
-						)
-					}
-					return gnet.Close
-				}
-				n := uint64(5 + len(respPayload))
-				atomic.AddUint64(&s.bytesWritten, n)
-				if len(s.shards) > 0 && int(st.shardID) < len(s.shards) {
-					s.shards[st.shardID].AddBytesWritten(n)
-				}
-			}
-			if st.closeAfterReply {
-				return gnet.Close
+			if action := s.runHandler(st.tlsConn, st, &msg, respType, respPayload, skipHandler, "failed to write tls response frame"); action != gnet.None {
+				return action
 			}
 		}
 		offset += totalPacketLen
@@ -403,86 +356,103 @@ func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 			}
 		}
 		if s.handler != nil {
-			var (
-				respType    MessageType
-				respPayload []byte
-				skipHandler bool
-			)
-			if msg.Type == MsgAuth {
-				result := s.handleAuthMessage(c, st, msg.Value)
-				if result.dispatched {
-					_, err = c.Discard(totalPacketLen)
-					if err != nil {
-						atomic.AddUint64(&s.protocolErrors, 1)
-						if s.logger.Enabled(log.LevelWarn) {
-							s.logger.Log(log.LevelWarn, "discarding packages not possible",
-								log.Int("total packet length", totalPacketLen),
-								log.String("error", err.Error()),
-							)
-						}
-					}
-					return gnet.None
-				}
-				respPayload, respType = result.respPayload, result.respType
-				skipHandler = true
-			} else if !st.authenticated && msg.Type != MsgPing {
-				respPayload, respType = ResponseAuthErr, MsgAuthErr
-				skipHandler = true
-			} else if s.policy != nil && !s.opAuthorized(msg, st) {
-				s.policy.IncDenied()
-				respPayload, respType = ResponseNotAuthorized, MsgError
-				skipHandler = true
+			respType, respPayload, skipHandler, dispatched := s.gateMessage(c, st, &msg)
+			if dispatched {
+				s.discardFrame(c, totalPacketLen)
+				return gnet.None
 			}
-			if !skipHandler {
-				// PING is not gated by RBAC and never counted as a role command,
-				// keeping per-role counts symmetric with the RESP data commands.
-				if s.policy != nil && st.session != nil && msg.Type != MsgPing {
-					st.session.CountCommand()
-				}
-				respPayload, respType, err = s.handler(&msg)
-			}
-			if err != nil {
-				atomic.AddUint64(&s.handlerErrors, 1)
-				if s.logger.Enabled(log.LevelWarn) {
-					s.logger.Log(log.LevelWarn, "application handler returned execution error",
-						log.String("error", err.Error()),
-					)
-				}
-				return gnet.Close
-			}
-			if respPayload != nil {
-				if err = Write(c, respType, respPayload); err != nil {
-					if s.logger.Enabled(log.LevelError) {
-						s.logger.Log(log.LevelError, "failed to write network response frame",
-							log.String("error", err.Error()),
-						)
-					}
-					return gnet.Close
-				}
-				n := uint64(5 + len(respPayload))
-				atomic.AddUint64(&s.bytesWritten, n)
-				if len(s.shards) > 0 {
-					if int(st.shardID) < len(s.shards) {
-						s.shards[st.shardID].AddBytesWritten(n)
-					}
-				}
-			}
-			if st.closeAfterReply {
-				return gnet.Close
+			if action := s.runHandler(c, st, &msg, respType, respPayload, skipHandler, "failed to write network response frame"); action != gnet.None {
+				return action
 			}
 		}
-		_, err = c.Discard(totalPacketLen)
+		s.discardFrame(c, totalPacketLen)
+	}
+	return gnet.None
+}
+
+// gateMessage authorizes one decoded frame against the connection state: it runs
+// the AUTH path (dispatching bcrypt to the worker pool when needed) and applies
+// the authentication and RBAC gates. skipHandler reports that respType and
+// respPayload already hold the reply and the handler must not run; dispatched
+// reports that the AUTH job was sent to the worker pool, so the caller must
+// consume the frame without writing a response.
+func (s *Server) gateMessage(c gnet.Conn, st *connState, msg *Message) (respType MessageType, respPayload []byte, skipHandler, dispatched bool) {
+	if msg.Type == MsgAuth {
+		result := s.handleAuthMessage(c, st, msg.Value)
+		if result.dispatched {
+			return 0, nil, false, true
+		}
+		return result.respType, result.respPayload, true, false
+	}
+	if !st.authenticated && msg.Type != MsgPing {
+		return MsgAuthErr, ResponseAuthErr, true, false
+	}
+	if s.policy != nil && !s.opAuthorized(*msg, st) {
+		s.policy.IncDenied()
+		return MsgError, ResponseNotAuthorized, true, false
+	}
+	return 0, nil, false, false
+}
+
+// runHandler executes the application handler for one frame unless the gate
+// supplied a reply, then writes the response and accounts the bytes against the
+// connection and its shard. writeError names the failing path for the log. It
+// returns gnet.Close on handler or write errors and when the connection is
+// marked to close after the reply.
+func (s *Server) runHandler(w io.Writer, st *connState, msg *Message, respType MessageType, respPayload []byte, skipHandler bool, writeError string) gnet.Action {
+	if !skipHandler {
+		// PING is not gated by RBAC and never counted as a role command, keeping
+		// per-role counts symmetric with the RESP data commands.
+		if s.policy != nil && st.session != nil && msg.Type != MsgPing {
+			st.session.CountCommand()
+		}
+		var err error
+		respPayload, respType, err = s.handler(msg)
 		if err != nil {
-			atomic.AddUint64(&s.protocolErrors, 1)
+			atomic.AddUint64(&s.handlerErrors, 1)
 			if s.logger.Enabled(log.LevelWarn) {
-				s.logger.Log(log.LevelWarn, "discarding packages not possible",
-					log.Int("total packet length", totalPacketLen),
+				s.logger.Log(log.LevelWarn, "application handler returned execution error",
 					log.String("error", err.Error()),
 				)
 			}
+			return gnet.Close
 		}
 	}
+	if respPayload != nil {
+		if err := Write(w, respType, respPayload); err != nil {
+			if s.logger.Enabled(log.LevelError) {
+				s.logger.Log(log.LevelError, writeError,
+					log.String("error", err.Error()),
+				)
+			}
+			return gnet.Close
+		}
+		n := uint64(5 + len(respPayload))
+		atomic.AddUint64(&s.bytesWritten, n)
+		if len(s.shards) > 0 && int(st.shardID) < len(s.shards) {
+			s.shards[st.shardID].AddBytesWritten(n)
+		}
+	}
+	if st.closeAfterReply {
+		return gnet.Close
+	}
 	return gnet.None
+}
+
+// discardFrame consumes one decoded frame from the gnet ring buffer and, when
+// that fails, counts a protocol error and logs a warning. totalPacketLen is the
+// full on-wire size including the 5-byte header.
+func (s *Server) discardFrame(c gnet.Conn, totalPacketLen int) {
+	_, err := c.Discard(totalPacketLen)
+	if err != nil {
+		atomic.AddUint64(&s.protocolErrors, 1)
+		if s.logger.Enabled(log.LevelWarn) {
+			s.logger.Log(log.LevelWarn, "discarding packages not possible",
+				log.Int("total packet length", totalPacketLen),
+				log.String("error", err.Error()),
+			)
+		}
+	}
 }
 
 // authFailed logs a rejected AUTH attempt, increments the per-connection fail
@@ -510,18 +480,13 @@ type authResult struct {
 	dispatched  bool // true when bcrypt was sent to the worker pool
 }
 
-// dummyAuthHash is a fixed bcrypt hash verified against an unknown user's
-// password so a failed AUTH for a nonexistent username takes as long as one for
-// a real user — otherwise response latency leaks which users exist. The worker
-// comparison always fails against it (mirrors the RESP dummyAuthHash).
-var dummyAuthHash = []byte("$2a$10$cwFksVIrb4lyV/GA2fAmWeUFmAkmYlUGwkxVoF9r3Ccaus0H5LdOW")
-
 // handleAuthMessage consolidates the MsgAuth branch shared by the TLS and
 // plaintext OnTraffic paths. It handles the no-password bypass, fast-rejects
-// malformed payloads, validates the username, makes a copy of the password for
-// the worker, and submits the job via dispatchAuth. It returns an authResult:
-// dispatched == true means the caller must consume the current frame and skip
-// response writing; otherwise respPayload/respType hold the synchronous result.
+// malformed payloads and unknown usernames, validates the username, makes a
+// copy of the password for the worker, and submits the job via dispatchAuth. It
+// returns an authResult: dispatched == true means the caller must consume the
+// current frame and skip response writing; otherwise respPayload/respType hold
+// the synchronous result.
 func (s *Server) handleAuthMessage(c gnet.Conn, st *connState, value []byte) authResult {
 	if s.requirePassHash == nil && s.policy == nil {
 		return authResult{respPayload: ResponseOK, respType: MsgAuthOk}
@@ -553,21 +518,18 @@ func (s *Server) handleAuthMessage(c gnet.Conn, st *connState, value []byte) aut
 		}
 		u := p.UserFor(name)
 		if u == nil {
-			// An unknown username must cost the same bcrypt work as a wrong
-			// password for a real user — otherwise AUTH latency leaks which
-			// usernames exist. Dispatch the job against a fixed dummy hash so
-			// the worker's comparison fails normally (see dummyAuthHash).
-			passHash = dummyAuthHash
-			reason = "unknown user"
-		} else {
-			// Empty hash marks a nopass user that accepts any password (Redis
-			// ACL semantics). The session is built from the same snapshot that
-			// yielded the hash, and the *Role it references is immutable across
-			// hot-swaps.
-			passHash = u.PasswordHash
-			session = rbac.NewSessionContext(name, p.RoleFor(name))
-			reason = "invalid password"
+			// Unknown usernames fail synchronously; the worker only records
+			// failures for real users, so log the attempt here for ACL LOG.
+			s.policy.LogAuthFailure(name, st.remoteAddr, "unknown user")
+			return authResult{respPayload: s.authFailed(st), respType: MsgAuthErr}
 		}
+		// Empty hash marks a nopass user that accepts any password (Redis
+		// ACL semantics). The session is built from the same snapshot that
+		// yielded the hash, and the *Role it references is immutable across
+		// hot-swaps.
+		passHash = u.PasswordHash
+		session = rbac.NewSessionContext(name, p.RoleFor(name))
+		reason = "invalid password"
 	} else {
 		if len(username) > 0 && string(username) != "default" {
 			return authResult{respPayload: s.authFailed(st), respType: MsgAuthErr}
