@@ -12,7 +12,11 @@ Authors:
 */
 package rbac
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/Saxy/Tellstone/internal/log"
+)
 
 // CreateRole adds a role built from rule tokens (+GET, +@read, ~prefix).
 // Fails when the role already exists or the rules are invalid. Existing
@@ -36,6 +40,9 @@ func (s *Store) CreateRole(name string, rules []string) error {
 	}
 	p.Roles[name] = role
 	s.Store(p)
+	if s.logger.Enabled(log.LevelInfo) {
+		s.logger.Log(log.LevelInfo, "rbac: role created", log.String("role", name))
+	}
 	return nil
 }
 
@@ -59,6 +66,12 @@ func (s *Store) SetUser(username, roleName string, passHash []byte) error {
 	}
 	p.Users[username] = &User{Role: roleName, PasswordHash: passHash}
 	s.Store(p)
+	if s.logger.Enabled(log.LevelInfo) {
+		s.logger.Log(log.LevelInfo, "rbac: user set",
+			log.String("username", username),
+			log.String("role", roleName),
+		)
+	}
 	return nil
 }
 
@@ -76,14 +89,21 @@ func (s *Store) DelUser(username string) error {
 	if p == nil {
 		return nil
 	}
-	if _, ok := p.Users[username]; ok {
-		if r := p.RoleFor(username); r != nil && r.Permissions.Has(CmdACL) && !p.hasOtherAdmin(username) {
-			return fmt.Errorf("rbac: cannot delete %q: last user with ACL management rights", username)
-		}
+	if _, ok := p.Users[username]; !ok {
+		// Unknown user: nothing to delete. Return before cloning, republishing,
+		// or logging so an absent name never fakes a deletion event against an
+		// unchanged policy.
+		return nil
+	}
+	if r := p.RoleFor(username); r != nil && r.Permissions.Has(CmdACL) && !p.hasOtherAdmin(username) {
+		return fmt.Errorf("rbac: cannot delete %q: last user with ACL management rights", username)
 	}
 	p = p.Clone()
 	delete(p.Users, username)
 	s.Store(p)
+	if s.logger.Enabled(log.LevelInfo) {
+		s.logger.Log(log.LevelInfo, "rbac: user deleted", log.String("username", username))
+	}
 	return nil
 }
 
@@ -123,5 +143,8 @@ func (s *Store) DeleteRole(name string) error {
 	}
 	delete(p.Roles, name)
 	s.Store(p)
+	if s.logger.Enabled(log.LevelInfo) {
+		s.logger.Log(log.LevelInfo, "rbac: role deleted", log.String("role", name))
+	}
 	return nil
 }
