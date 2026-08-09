@@ -16,6 +16,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"time"
@@ -29,6 +30,10 @@ var (
 
 	// ErrRequestTooLarge is returned if the generated request exceeds the local stack buffer boundaries.
 	ErrRequestTooLarge = errors.New("client: key or value size exceeds local client packaging limitations")
+
+	// ErrAuthCredentialsTooLong is returned when an AUTH credential exceeds the
+	// uint16 length prefix of the binary auth frame.
+	ErrAuthCredentialsTooLong = errors.New("client: auth credential exceeds 65535 byte protocol limit")
 )
 
 // Client represents a high-performance synchronous connection to a Tellstone server.
@@ -208,17 +213,29 @@ func (c *Client) Delete(key []byte, scratchBuf []byte) ([]byte, error) {
 // Auth authenticates the client with a password (single-password mode, username empty).
 // scratchBuf must be large enough to hold the server response. Returns nil on success.
 func (c *Client) Auth(password string, scratchBuf []byte) error {
-	payloadLen := 2 + 0 + 2 + len(password)
-	var reqBuf [512]byte
-	if payloadLen > len(reqBuf) {
-		return ErrRequestTooLarge
+	// The auth frame's length prefixes are uint16 fields; a longer credential
+	// would wrap them on the wire, so reject it up front instead of sending a
+	// corrupt frame.
+	if len(password) > math.MaxUint16 {
+		return ErrAuthCredentialsTooLong
 	}
-	binary.BigEndian.PutUint16(reqBuf[0:2], 0) // usernameLen = 0 (single-password mode)
-	binary.BigEndian.PutUint16(reqBuf[2:4], uint16(len(password)))
-	copy(reqBuf[4:payloadLen], password)
+	payloadLen := 2 + 0 + 2 + len(password)
+	// Short passwords serialize into the stack buffer, keeping connection setup
+	// allocation-free. OIDC bearer tokens (id_tokens) routinely exceed 512 bytes,
+	// so fall back to a one-time heap buffer when the payload overflows the stack.
+	var stackBuf [512]byte
+	var payload []byte
+	if payloadLen > len(stackBuf) {
+		payload = make([]byte, payloadLen)
+	} else {
+		payload = stackBuf[:payloadLen]
+	}
+	binary.BigEndian.PutUint16(payload[0:2], 0) // usernameLen = 0 (single-password mode)
+	binary.BigEndian.PutUint16(payload[2:4], uint16(len(password)))
+	copy(payload[4:payloadLen], password)
 
 	var resp Message
-	if err := c.Call(MsgAuth, reqBuf[:payloadLen], scratchBuf, &resp); err != nil {
+	if err := c.Call(MsgAuth, payload, scratchBuf, &resp); err != nil {
 		return err
 	}
 	if resp.Type != MsgAuthOk {

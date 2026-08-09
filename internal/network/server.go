@@ -11,6 +11,7 @@ Authors:
 package network
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/Saxy/Tellstone/internal/audit"
 	"github.com/Saxy/Tellstone/internal/log"
+	"github.com/Saxy/Tellstone/internal/oauth"
 	"github.com/Saxy/Tellstone/internal/rbac"
 	"github.com/Saxy/Tellstone/internal/shard"
 	tlslib "github.com/Saxy/Tellstone/internal/tls"
@@ -44,6 +46,10 @@ type authJob struct {
 	// when verification fails; username is empty in single-password mode.
 	username string
 	reason   string
+	// oauth marks a bearer-token verification: password holds the raw JWT,
+	// passHash is nil, and the session is built only after claims resolve to a
+	// role via the policy's oauth.rules.
+	oauth bool
 }
 
 // connState holds per-connection state. When TLS is enabled, tlsConn wraps the
@@ -99,6 +105,13 @@ type Server struct {
 	// per-user bcrypt hashes and every data op is gated by the session.
 	policy *rbac.Store
 
+	// oauth is the token-verification provider for bearer-token AUTH. nil keeps
+	// the password-only paths; when set, a JWT-shaped AUTH secret is verified
+	// here and mapped to a role through the policy store (fail-closed on both
+	// a bad token and a claim set that maps to no role). It is read-only after
+	// construction, so workers may share it without locks.
+	oauth oauth.Provider
+
 	// audit is the shared audit engine. Always non-nil: without --enable-audit
 	// it is a disabled no-op whose Record() costs one bool comparison, so the
 	// hooks below call it without a nil guard.
@@ -117,6 +130,9 @@ type Server struct {
 // otherwise it is hashed at startup and clients must AUTH before issuing data commands.
 // policy is optional — if nil, RBAC is disabled and every authenticated op is allowed;
 // otherwise AUTH resolves per-user credentials and sessions gate data ops.
+// provider is optional — if nil, bearer-token AUTH is disabled and AUTH stays
+// password-only; when set it verifies JWT-shaped secrets and maps their claims to
+// roles through the policy store (which must therefore also be set).
 // audit is the shared audit engine; it must be non-nil (pass a disabled engine when
 // audit logging is off) and is always called without a nil guard.
 func NewServer(
@@ -128,6 +144,7 @@ func NewServer(
 	tlsConfigs *tlslib.ConfigStore,
 	requirePass string,
 	policy *rbac.Store,
+	provider oauth.Provider,
 	audit *audit.LogEngine) *Server {
 	if logger == nil {
 		logger = log.NewNoOpLogger()
@@ -159,9 +176,10 @@ func NewServer(
 		shards:          shards,
 		requirePassHash: passHash,
 		policy:          policy,
+		oauth:           provider,
 		audit:           audit,
 	}
-	if passHash != nil || policy != nil {
+	if passHash != nil || policy != nil || provider != nil {
 		s.authJobs = make(chan authJob, 256)
 		for i := 0; i < numAuthWorkers; i++ {
 			s.workerWg.Add(1)
@@ -571,6 +589,12 @@ type authResult struct {
 	dispatched  bool // true when bcrypt was sent to the worker pool
 }
 
+var tokenPool = sync.Pool{
+	New: func() interface{} {
+		return bytes.NewBuffer(make([]byte, 0, 4096))
+	},
+}
+
 // handleAuthMessage consolidates the MsgAuth branch shared by the TLS and
 // plaintext OnTraffic paths. It handles the no-password bypass, fast-rejects
 // malformed payloads and unknown usernames, validates the username, makes a
@@ -591,6 +615,18 @@ func (s *Server) handleAuthMessage(c gnet.Conn, st *connState, value []byte) aut
 			s.policy.LogAuthFailure("", st.remoteAddr, "malformed request")
 		}
 		return authResult{respPayload: s.authFailed(st, "", "malformed request"), respType: MsgAuthErr}
+	}
+	// A JWT-shaped secret is a bearer token, not a password: route it to the
+	// oauth provider (which maps claims to a role) before any username lookup.
+	if s.oauth != nil && len(username) == 0 && oauth.IsJWT(password) {
+		buf := tokenPool.Get().(*bytes.Buffer)
+		buf.Reset()
+		buf.Write(password)
+		if s.dispatchOAuth(c, buf.Bytes()) {
+			st.authPending = true
+			return authResult{dispatched: true}
+		}
+		return authResult{respPayload: ResponseAuthErr, respType: MsgAuthErr}
 	}
 	var (
 		passHash []byte
@@ -646,6 +682,18 @@ func (s *Server) authWorker() {
 		// (Redis ACL semantics). In single-password mode passHash is never
 		// nil because the workers only run when a hash or a policy exists.
 		success := job.passHash == nil || bcrypt.CompareHashAndPassword(job.passHash, job.password) == nil
+		if job.oauth {
+			// Bearer-token path: the session is unknown until the claims are
+			// verified and mapped to a role, so it is resolved here rather than
+			// pinned at dispatch time. The provider is concurrency-safe; the
+			// store maps claim to a role of a lock-free atomic snapshot.
+			job.session, job.username = s.policy.ResolveOAuthToken(func() (map[string][]string, error) {
+				ctx, cancel := context.WithTimeout(context.Background(), oauth.VerifyTimeout)
+				defer cancel()
+				return s.oauth.Verify(ctx, job.password)
+			})
+			success = job.session != nil
+		}
 		_ = job.c.Wake(func(c gnet.Conn, _ error) error {
 			st, _ := c.Context().(*connState)
 			if st == nil {
@@ -717,6 +765,23 @@ func (s *Server) authWorker() {
 func (s *Server) dispatchAuth(c gnet.Conn, username, reason string, password, passHash []byte, session *rbac.SessionContext) bool {
 	select {
 	case s.authJobs <- authJob{c: c, password: password, passHash: passHash, session: session, username: username, reason: reason}:
+		return true
+	default:
+		if s.logger.Enabled(log.LevelWarn) {
+			s.logger.Log(log.LevelWarn, "network: auth worker pool saturated, rejecting AUTH",
+				log.String("remote_addr", c.RemoteAddr().String()),
+			)
+		}
+		return false
+	}
+}
+
+// dispatchOAuth submits a bearer-token verification to the worker pool. token
+// is a private copy owned by the job. Returns false when the pool is saturated
+// so the caller fails AUTH synchronously instead of stalling the connection.
+func (s *Server) dispatchOAuth(c gnet.Conn, token []byte) bool {
+	select {
+	case s.authJobs <- authJob{c: c, password: token, oauth: true, reason: "invalid token"}:
 		return true
 	default:
 		if s.logger.Enabled(log.LevelWarn) {
