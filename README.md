@@ -138,7 +138,8 @@ Every option is available as a flag and an environment variable.
 | `--evict-interval`    | `TSD_EVICT_INTERVAL`    | `1s`             | Chronometer tick interval (`0` disables active eviction) |
 | `--evict-slots`       | `TSD_EVICT_SLOTS`       | `256`            | Timing‑wheel slot count                                  |
 | `--enable-encryption` | `TSD_ENABLE_ENCRYPTION` | `false`          | Enable ChaCha20‑Poly1305 at‑rest encryption              |
-| `--encryption-key`    | `TSD_ENCRYPTION_KEY`    | _(none)_         | 32‑byte key (required when encryption is on)             |
+| `--encryption-key`    | `TSD_ENCRYPTION_KEY`    | _(none)_         | Base‑64 encoded 32‑byte key (one key source is required when encryption is on) |
+| `--encryption-key-file`| `TSD_ENCRYPTION_KEY_FILE`| _(none)_        | Path to a file holding the raw 32‑byte key; mutually exclusive with `--encryption-key` |
 | `--enable-metrics`    | `TSD_ENABLE_METRICS`    | `false`          | Enable the Prometheus exporter                           |
 | `--metrics-addr`      | `TSD_METRICS_ADDR`      | `:9100`          | Prometheus exporter address (`/metrics`)                 |
 | `--trace-ratio`       | `TSD_TRACE_RATIO`       | `0.0`            | OpenTelemetry sample ratio (`0` disables)                |
@@ -160,6 +161,35 @@ Every option is available as a flag and an environment variable.
 Runtime tuning (environment only): `TSD_GC_PERCENT` (default `-1`, GC off for a zero‑GC hot
 path), `TSD_MEM_LIMIT_BYTES` (soft heap ceiling), `TSD_ENABLE_PROFILING` (serves `pprof` on
 `127.0.0.1:6060`).
+
+At-rest encryption takes its 32-byte key from exactly one source. `--encryption-key` carries it
+**base64-encoded**, because process arguments and environment variables are NUL-terminated and
+roughly 1 in 8 random 32-byte keys contains a `0x00` byte that cannot survive them:
+
+```bash
+tellstone --enable-encryption --encryption-key "$(openssl rand -base64 32)"
+```
+
+`--encryption-key-file` carries the same key as **raw, unencoded bytes**, which suits a mounted
+Kubernetes Secret or a vault-agent-rendered file. Every byte of the file is significant, so it must
+be exactly 32 bytes with no trailing newline:
+
+```bash
+# umask 077 in a subshell so the file is created 0600; a later chmod would leave
+# the key world-readable in between.
+(umask 077; head -c 32 /dev/urandom > /etc/tellstone/key)
+tellstone --enable-encryption --encryption-key-file /etc/tellstone/key
+```
+
+The key is read once at startup; rotating it requires a restart. Enabling encryption without either
+source is refused at startup rather than silently falling back to plaintext.
+
+> **Deprecated:** `--encryption-key` previously used the value as raw text, so a literal
+> 32-character key such as `0123456789abcdef0123456789abcdef` was accepted. That form still
+> works and logs a warning at startup, but it is insecure and will be removed in the next
+> major release. Re-encode an existing key with `base64 < <keyfile>`, or move it to
+> `--encryption-key-file`. The two forms are never ambiguous: a base64 key is 44 characters
+> (43 unpadded), while a 32-character value can only decode to 24 bytes.
 
 When TLS is enabled, Tellstone watches the parent directories of the certificate, key, and
 optional client CA. Valid replacements are applied after a 500 ms debounce; existing TLS
